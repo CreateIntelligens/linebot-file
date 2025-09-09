@@ -25,8 +25,8 @@ WORKDIR /app
 # 從 builder 階段複製編譯好的執行檔
 COPY --from=builder /app/server /app/server
 
-# Cloud Run 會自動提供 PORT 環境變數，預設為 8080
-EXPOSE 8080
+# Expose default app port (configurable via PORT env; default 5000)
+EXPOSE 5000
 
 # 執行應用程式
 CMD ["/app/server"]

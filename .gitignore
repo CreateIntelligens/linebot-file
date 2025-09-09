@@ -1,2 +1,4 @@
 linebot-file
 .DS_Store
+.env
+client_secret.json

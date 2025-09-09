@@ -1,0 +1,25 @@
+version: "3.9"
+
+services:
+  mongo:
+    image: mongo:6.0
+    container_name: mongo
+    restart: unless-stopped
+    environment:
+      MONGO_INITDB_ROOT_USERNAME: ${MONGO_INITDB_ROOT_USERNAME}
+      MONGO_INITDB_ROOT_PASSWORD: ${MONGO_INITDB_ROOT_PASSWORD}
+    volumes:
+      - ./data/mongo:/data/db
+    ports:
+      - "27017:27017"  # optional: expose for external tools; remove if not needed
+
+  app:
+    build: .
+    container_name: linebot-file
+    restart: unless-stopped
+    env_file: .env
+    depends_on:
+      - mongo
+    ports:
+      - "127.0.0.1:5000:5000"
+    # If you prefer to expose directly, use: "80:5000" (not recommended without TLS)

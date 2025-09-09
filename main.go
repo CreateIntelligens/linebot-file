@@ -16,6 +16,7 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/base64"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -24,7 +25,6 @@ import (
 	"os"
 	"time"
 
-	"cloud.google.com/go/firestore"
 	"github.com/line/line-bot-sdk-go/v8/linebot/messaging_api"
 	"github.com/line/line-bot-sdk-go/v8/linebot/webhook"
 	"golang.org/x/oauth2"
@@ -32,13 +32,15 @@ import (
 	"google.golang.org/api/drive/v3"
 	"google.golang.org/api/googleapi"
 	"google.golang.org/api/option"
-	"google.golang.org/grpc/codes"
-	"google.golang.org/grpc/status"
+	"go.mongodb.org/mongo-driver/mongo"
+	"go.mongodb.org/mongo-driver/mongo/options"
+	"go.mongodb.org/mongo-driver/bson"
 )
 
 var (
 	googleOauthConfig      *oauth2.Config
-	firestoreClient        *firestore.Client
+	mongoClient            *mongo.Client
+	mongoDB                *mongo.Database
 	ErrOauth2TokenNotFound = errors.New("oauth2 token not found")
 )
 
@@ -51,22 +53,74 @@ const (
 
 func main() {
 	ctx := context.Background()
-	projectID := os.Getenv("GOOGLE_CLOUD_PROJECT")
-	if projectID == "" {
-		log.Fatal("GOOGLE_CLOUD_PROJECT environment variable must be set.")
+
+	mongoURI := os.Getenv("MONGODB_URI")
+	if mongoURI == "" {
+		log.Fatal("MONGODB_URI environment variable must be set.")
+	}
+	dbName := os.Getenv("MONGODB_DB")
+	if dbName == "" {
+		dbName = "linebot_file"
 	}
 
 	var err error
-	firestoreClient, err = firestore.NewClient(ctx, projectID)
+	mongoClient, err = mongo.Connect(ctx, options.Client().ApplyURI(mongoURI))
 	if err != nil {
-		log.Fatalf("Failed to create Firestore client: %v", err)
+		log.Fatalf("Failed to create MongoDB client: %v", err)
 	}
-	defer firestoreClient.Close()
+	if err = mongoClient.Ping(ctx, nil); err != nil {
+		log.Fatalf("Failed to ping MongoDB: %v", err)
+	}
+	mongoDB = mongoClient.Database(dbName)
+	// Ensure TTL index for oauth state doc cleanup (10 minutes)
+	_, err = mongoDB.Collection(stateCollection).Indexes().CreateOne(ctx, mongo.IndexModel{
+		Keys:    bson.D{{Key: "created_at", Value: 1}},
+		Options: options.Index().SetExpireAfterSeconds(600),
+	})
+	if err != nil {
+		log.Printf("Failed to create TTL index on %s.created_at: %v", stateCollection, err)
+	}
+	defer func() {
+		if err := mongoClient.Disconnect(ctx); err != nil {
+			log.Printf("Error disconnecting MongoDB: %v", err)
+		}
+	}()
+
+	// Load Google OAuth configuration from env or fallback to client_secret.json if missing
+	googleClientID := os.Getenv("GOOGLE_CLIENT_ID")
+	googleClientSecret := os.Getenv("GOOGLE_CLIENT_SECRET")
+	if googleClientID == "" || googleClientSecret == "" {
+		if data, err := os.ReadFile("client_secret.json"); err == nil {
+			var cs struct {
+				Web struct {
+					ClientID     string   `json:"client_id"`
+					ClientSecret string   `json:"client_secret"`
+					RedirectURIs []string `json:"redirect_uris"`
+				} `json:"web"`
+			}
+			if jerr := json.Unmarshal(data, &cs); jerr == nil {
+				if googleClientID == "" {
+					googleClientID = cs.Web.ClientID
+				}
+				if googleClientSecret == "" {
+					googleClientSecret = cs.Web.ClientSecret
+				}
+				// Only set GOOGLE_REDIRECT_URL from file if env missing and file有值
+				if os.Getenv("GOOGLE_REDIRECT_URL") == "" && len(cs.Web.RedirectURIs) > 0 {
+					os.Setenv("GOOGLE_REDIRECT_URL", cs.Web.RedirectURIs[0])
+				}
+			} else {
+				log.Printf("Failed to parse client_secret.json: %v", jerr)
+			}
+		} else {
+			log.Printf("client_secret.json not found or unreadable: %v", err)
+		}
+	}
 
 	googleOauthConfig = &oauth2.Config{
 		RedirectURL:  os.Getenv("GOOGLE_REDIRECT_URL"),
-		ClientID:     os.Getenv("GOOGLE_CLIENT_ID"),
-		ClientSecret: os.Getenv("GOOGLE_CLIENT_SECRET"),
+		ClientID:     googleClientID,
+		ClientSecret: googleClientSecret,
 		Scopes:       []string{drive.DriveFileScope},
 		Endpoint:     google.Endpoint,
 	}
@@ -120,13 +174,14 @@ func main() {
 						userID := e.Source.(webhook.UserSource).UserId
 						state := generateState()
 
-						// Store state and user ID in Firestore with a short expiration
-						_, err := firestoreClient.Collection(stateCollection).Doc(state).Set(ctx, map[string]interface{}{
+						// Store state and user ID in MongoDB with a short expiration
+						_, err := mongoDB.Collection(stateCollection).InsertOne(ctx, bson.M{
+							"_id":        state,
 							"user_id":    userID,
 							"created_at": time.Now(),
 						})
 						if err != nil {
-							log.Printf("Failed to save state to firestore: %v", err)
+							log.Printf("Failed to save state to mongodb: %v", err)
 							// Optionally reply to user about the error
 							return
 						}
@@ -320,12 +375,13 @@ func main() {
 
 						// 2. Start new connection flow (same as /connect_drive)
 						state := generateState()
-						_, err = firestoreClient.Collection(stateCollection).Doc(state).Set(ctx, map[string]interface{}{
+						_, err = mongoDB.Collection(stateCollection).InsertOne(ctx, bson.M{
+							"_id":        state,
 							"user_id":    userID,
 							"created_at": time.Now(),
 						})
 						if err != nil {
-							log.Printf("Failed to save state to firestore for reconnect: %v", err)
+							log.Printf("Failed to save state to mongodb for reconnect: %v", err)
 							// Reply with an error message
 							if _, err = bot.ReplyMessage(
 								&messaging_api.ReplyMessageRequest{
@@ -450,23 +506,20 @@ func oauthCallbackHandler(w http.ResponseWriter, r *http.Request) {
 	state := r.FormValue("state")
 	code := r.FormValue("code")
 
-	// 1. Validate state and get user ID from Firestore
-	doc, err := firestoreClient.Collection(stateCollection).Doc(state).Get(ctx)
+	// 1. Validate state and get user ID from MongoDB
+	var stateData struct {
+		UserID string `bson:"user_id"`
+	}
+	// find the state document by _id
+	err := mongoDB.Collection(stateCollection).FindOne(ctx, bson.M{"_id": state}).Decode(&stateData)
 	if err != nil {
 		log.Printf("Invalid oauth google state: %s, error: %v", state, err)
 		http.Error(w, "Invalid state parameter. Please try again.", http.StatusBadRequest)
 		return
 	}
 	// Delete state after use to prevent replay attacks
-	defer doc.Ref.Delete(ctx)
-
-	var stateData struct {
-		UserID string `firestore:"user_id"`
-	}
-	if err := doc.DataTo(&stateData); err != nil {
-		log.Printf("Failed to parse state data: %v", err)
-		http.Error(w, "Internal server error.", http.StatusInternalServerError)
-		return
+	if _, err := mongoDB.Collection(stateCollection).DeleteOne(ctx, bson.M{"_id": state}); err != nil {
+		log.Printf("Failed to delete state %s: %v", state, err)
 	}
 	userID := stateData.UserID
 
@@ -478,10 +531,10 @@ func oauthCallbackHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// 3. Store the token in Firestore, using the userID as the document ID
-	_, err = firestoreClient.Collection(tokenCollection).Doc(userID).Set(ctx, token)
+	// 3. Store the token in MongoDB, using the userID as the document ID
+	_, err = mongoDB.Collection(tokenCollection).UpdateByID(ctx, userID, bson.M{"$set": token}, options.Update().SetUpsert(true))
 	if err != nil {
-		log.Printf("Failed to save token to firestore: %v", err)
+		log.Printf("Failed to save token to mongodb: %v", err)
 		http.Error(w, "Failed to save token.", http.StatusInternalServerError)
 		return
 	}
@@ -501,17 +554,13 @@ func oauthCallbackHandler(w http.ResponseWriter, r *http.Request) {
 }
 
 func getGoogleDriveService(userID string) (*drive.Service, error) {
-	doc, err := firestoreClient.Collection(tokenCollection).Doc(userID).Get(context.Background())
+	var token oauth2.Token
+	err := mongoDB.Collection(tokenCollection).FindOne(context.Background(), bson.M{"_id": userID}).Decode(&token)
 	if err != nil {
-		if status.Code(err) == codes.NotFound {
+		if err == mongo.ErrNoDocuments {
 			return nil, ErrOauth2TokenNotFound
 		}
-		return nil, fmt.Errorf("failed to get token from firestore: %w", err)
-	}
-
-	var token oauth2.Token
-	if err := doc.DataTo(&token); err != nil {
-		return nil, fmt.Errorf("failed to parse token data: %w", err)
+		return nil, fmt.Errorf("failed to get token from mongodb: %w", err)
 	}
 
 	return drive.NewService(context.Background(), option.WithTokenSource(googleOauthConfig.TokenSource(context.Background(), &token)))
@@ -599,19 +648,14 @@ func getRecentFiles(srv *drive.Service, count int64) ([]*drive.File, error) {
 }
 
 func revokeGoogleToken(ctx context.Context, userID string) error {
-	// 1. Get token from Firestore
-	docRef := firestoreClient.Collection(tokenCollection).Doc(userID)
-	doc, err := docRef.Get(ctx)
+	// 1. Get token from MongoDB
+	var token oauth2.Token
+	err := mongoDB.Collection(tokenCollection).FindOne(ctx, bson.M{"_id": userID}).Decode(&token)
 	if err != nil {
-		if status.Code(err) == codes.NotFound {
+		if err == mongo.ErrNoDocuments {
 			return ErrOauth2TokenNotFound
 		}
-		return fmt.Errorf("failed to get token from firestore: %w", err)
-	}
-
-	var token oauth2.Token
-	if err := doc.DataTo(&token); err != nil {
-		return fmt.Errorf("failed to parse token data: %w", err)
+		return fmt.Errorf("failed to get token from mongodb: %w", err)
 	}
 
 	// Token to revoke - prefer refresh token as it invalidates all derived access tokens
@@ -634,10 +678,10 @@ func revokeGoogleToken(ctx context.Context, userID string) error {
 		log.Printf("Google revocation failed for user %s with status %d: %s", userID, resp.StatusCode, string(body))
 	}
 
-	// 3. Delete token from Firestore regardless of revocation status
-	if _, err := docRef.Delete(ctx); err != nil {
-		log.Printf("CRITICAL: Failed to delete token for user %s from Firestore after revocation attempt: %v", userID, err)
-		return fmt.Errorf("failed to delete token from firestore: %w", err)
+	// 3. Delete token from MongoDB regardless of revocation status
+	if _, err := mongoDB.Collection(tokenCollection).DeleteOne(ctx, bson.M{"_id": userID}); err != nil {
+		log.Printf("CRITICAL: Failed to delete token for user %s from MongoDB after revocation attempt: %v", userID, err)
+		return fmt.Errorf("failed to delete token from mongodb: %w", err)
 	}
 
 	// 4. Link the connect rich menu back to the user

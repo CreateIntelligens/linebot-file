@@ -32,18 +32,18 @@
     在您的 Google Cloud 專案中，啟用以下服務：
     *   **Cloud Run API**
     *   **Cloud Build API** (用於自動建置容器映像檔)
-    *   **Firestore API** (用於儲存使用者授權資料)
+    *   MongoDB (用於儲存使用者授權資料)
 
     您可以使用 gcloud CLI 快速啟用：
     ```bash
-    gcloud services enable run.googleapis.com cloudbuild.googleapis.com firestore.googleapis.com
+    gcloud services enable run.googleapis.com cloudbuild.googleapis.com
     ```
 
-2.  **建立 Firestore 資料庫**
+2.  佈署 MongoDB 或使用雲端 MongoDB 服務（例如 MongoDB Atlas），並取得連線字串
 
-    *   前往 Google Cloud Console 的 Firestore 頁面。
-    *   選擇「原生模式 (Native mode)」。
-    *   選擇離您使用者最近的地區，然後建立資料庫。
+    *   建議在 MongoDB 上建立一個資料庫（預設名稱為 `linebot_file`，可透過環境變數覆寫）。
+    *   建議建立使用者並設定適當權限。
+    *   本服務會自動在 `oauth_states` 集合上建立 TTL 索引以清除逾時的狀態文件（10 分鐘）。
 
 3.  **取得 Google OAuth 憑證**
 
@@ -154,7 +154,9 @@
       --set-env-vars="ChannelAccessToken=YOUR_CHANNEL_ACCESS_TOKEN" \
       --set-env-vars="GOOGLE_CLIENT_ID=YOUR_GOOGLE_CLIENT_ID" \
       --set-env-vars="GOOGLE_CLIENT_SECRET=YOUR_GOOGLE_CLIENT_SECRET" \
-      --set-env-vars="GOOGLE_REDIRECT_URL=YOUR_CLOUD_RUN_URL/oauth/callback"
+      --set-env-vars="GOOGLE_REDIRECT_URL=YOUR_CLOUD_RUN_URL/oauth/callback" \
+      --set-env-vars="MONGODB_URI=YOUR_MONGODB_CONNECTION_URI" \
+      --set-env-vars="MONGODB_DB=linebot_file"
     ```
     **參數說明：**
     *   `linebot-file-service`: 您的 Cloud Run 服務名稱，可自訂。
